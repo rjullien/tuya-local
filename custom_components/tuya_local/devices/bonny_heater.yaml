@@ -1,0 +1,112 @@
+name: Panel heater
+products:
+  - id: q3kk3dtwme9avo8p
+    manufacturer: Bonny
+    model: Bonny
+entities:
+  - entity: climate
+    translation_key: heater
+    dps:
+      - id: 1
+        type: boolean
+        name: hvac_mode
+        mapping:
+          - dps_val: false
+            value: "off"
+          - dps_val: true
+            value: heat
+      - id: 2
+        type: integer
+        name: temperature
+        unit: C
+        range:
+          min: 30
+          max: 320
+        mapping:
+          - scale: 10
+            step: 5
+      - id: 4
+        type: string
+        name: preset_mode
+        mapping:
+          - dps_val: comfor
+            value: comfort
+          - dps_val: eco
+            value: eco
+      - id: 11
+        type: string
+        name: hvac_action
+        optional: true
+        mapping:
+          - dps_val: standby
+            value: idle
+          - value: heating
+  - entity: lock
+    translation_key: child_lock
+    category: config
+    dps:
+      - id: 7
+        type: boolean
+        name: lock
+  - entity: binary_sensor
+    class: problem
+    category: diagnostic
+    dps:
+      - id: 13
+        type: bitfield
+        name: sensor
+        optional: true
+        mapping:
+          - dps_val: 0
+            value: false
+          - value: true
+      - id: 13
+        type: bitfield
+        name: fault_code
+        optional: true
+  - entity: sensor
+    class: energy
+    category: diagnostic
+    dps:
+      - id: 101
+        type: integer
+        name: sensor
+        optional: true
+        unit: kWh
+        class: total_increasing
+        mapping:
+          - scale: 100
+  - entity: sensor
+    name: Hourly usage
+    class: duration
+    category: diagnostic
+    dps:
+      - id: 102
+        type: integer
+        name: sensor
+        optional: true
+        unit: min
+        class: measurement
+  - entity: switch
+    name: Open window detection
+    category: config
+    dps:
+      - id: 105
+        type: boolean
+        name: switch
+        optional: true
+  - entity: number
+    translation_key: temperature_calibration
+    class: temperature_delta
+    category: config
+    dps:
+      - id: 107
+        type: integer
+        name: value
+        unit: C
+        optional: true
+        range:
+          min: -5
+          max: 5
+        mapping:
+          - scale: 10
