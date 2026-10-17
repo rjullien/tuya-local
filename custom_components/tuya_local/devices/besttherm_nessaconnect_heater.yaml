@@ -20,8 +20,8 @@ entities:
         name: temperature
         unit: C
         range:
-          min: 15
-          max: 290
+          min: 30
+          max: 320
         mapping:
           - scale: 10
             step: 5
@@ -31,6 +31,8 @@ entities:
         mapping:
           - dps_val: comfor
             value: comfort
+          - dps_val: eco
+            value: eco
           - dps_val: economics
             value: eco
           - dps_val: antifreezing
@@ -78,14 +80,15 @@ entities:
         type: bitfield
         name: fault_code
   - entity: sensor
-    class: energy
+    name: Energy last hour
+    icon: "mdi:lightning-bolt"
     category: diagnostic
     dps:
       - id: 101
         type: integer
         name: sensor
         unit: kWh
-        class: total_increasing
+        class: measurement
         mapping:
           - scale: 100
   - entity: sensor
@@ -98,14 +101,6 @@ entities:
         name: sensor
         unit: min
         class: measurement
-  - entity: button
-    name: Time calibration
-    category: config
-    dps:
-      - id: 103
-        type: boolean
-        optional: true
-        name: button
   - entity: text
     translation_key: schedule
     category: config
@@ -134,5 +129,25 @@ entities:
         range:
           min: -5
           max: 5
-        mapping:
-          - scale: 10
+  - entity: switch
+    name: Adaptive start
+    icon: "mdi:clock-start"
+    category: config
+    dps:
+      - id: 106
+        type: boolean
+        name: switch
+        optional: true
+  - entity: number
+    name: Eco offset
+    class: temperature_delta
+    category: config
+    dps:
+      - id: 110
+        type: integer
+        name: value
+        unit: C
+        optional: true
+        range:
+          min: 1
+          max: 10
