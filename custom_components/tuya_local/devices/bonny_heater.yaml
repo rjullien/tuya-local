@@ -33,6 +33,16 @@ entities:
             value: comfort
           - dps_val: eco
             value: eco
+          - dps_val: antifreezing
+            value: away
+          - dps_val: p1
+            value: program_1
+          - dps_val: p2
+            value: program_2
+          - dps_val: p3
+            value: program_3
+          - dps_val: prog
+            value: external_control
       - id: 11
         type: string
         name: hvac_action
@@ -40,6 +50,8 @@ entities:
         mapping:
           - dps_val: standby
             value: idle
+          - dps_val: antifreezing
+            value: defrosting
           - value: heating
   - entity: lock
     translation_key: child_lock
@@ -65,7 +77,8 @@ entities:
         name: fault_code
         optional: true
   - entity: sensor
-    class: energy
+    name: Energy last hour
+    icon: "mdi:lightning-bolt"
     category: diagnostic
     dps:
       - id: 101
@@ -73,7 +86,7 @@ entities:
         name: sensor
         optional: true
         unit: kWh
-        class: total_increasing
+        class: measurement
         mapping:
           - scale: 100
   - entity: sensor
@@ -87,6 +100,15 @@ entities:
         optional: true
         unit: min
         class: measurement
+  - entity: text
+    translation_key: schedule
+    category: config
+    hidden: true
+    dps:
+      - id: 104
+        type: base64
+        optional: true
+        name: value
   - entity: switch
     name: Open window detection
     category: config
@@ -108,5 +130,25 @@ entities:
         range:
           min: -5
           max: 5
-        mapping:
-          - scale: 10
+  - entity: switch
+    name: Adaptive start
+    icon: "mdi:clock-start"
+    category: config
+    dps:
+      - id: 106
+        type: boolean
+        name: switch
+        optional: true
+  - entity: number
+    name: Eco offset
+    class: temperature_delta
+    category: config
+    dps:
+      - id: 110
+        type: integer
+        name: value
+        unit: C
+        optional: true
+        range:
+          min: 1
+          max: 10
