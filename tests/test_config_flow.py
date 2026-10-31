@@ -1,5 +1,6 @@
 """Tests for the config flow."""
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -27,6 +28,7 @@ from custom_components.tuya_local.const import (
     CONF_TYPE,
     DOMAIN,
 )
+from custom_components.tuya_local.device import async_setup_device
 
 # Designed to contain "special" characters that users constantly suspect.
 TESTKEY = ")<jO<@)'P1|kR$Kd"
@@ -101,6 +103,9 @@ async def test_async_setup_entry_cleans_up_failed_device(hass, mocker, refresh_e
     """Failed runtime setup should not leave stale device state cached."""
 
     mock_device = mocker.MagicMock()
+    mock_device.async_stop = mocker.AsyncMock()
+    mock_device._api.parent = None
+    mock_device._api.children = {}
     if refresh_error is None:
         mock_device.async_refresh = mocker.AsyncMock()
         mock_device.has_returned_state = False
@@ -112,12 +117,12 @@ async def test_async_setup_entry_cleans_up_failed_device(hass, mocker, refresh_e
         hass.data[DOMAIN]["deviceid"] = {
             "device": mock_device,
             "tuyadevice": mock_device._api,
-            "tuyadevicelock": mocker.MagicMock(),
+            "tuyadevicelock": asyncio.Lock(),
         }
         return mock_device
 
     mocker.patch(
-        "custom_components.tuya_local.setup_device", side_effect=fake_setup_device
+        "custom_components.tuya_local.async_setup_device", side_effect=fake_setup_device
     )
 
     entry = MockConfigEntry(
@@ -141,6 +146,44 @@ async def test_async_setup_entry_cleans_up_failed_device(hass, mocker, refresh_e
 
     assert "deviceid" not in hass.data.get(DOMAIN, {})
     mock_device._api.set_socketPersistent.assert_called_with(False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_sibling", [False, True])
+async def test_failed_zigbee_setup_releases_only_failed_child(
+    hass, mocker, with_sibling
+):
+    config = {
+        CONF_DEVICE_ID: "synthetic-gateway",
+        CONF_HOST: "127.0.0.1",
+        CONF_LOCAL_KEY: "0123456789abcdef",
+        CONF_POLL_ONLY: True,
+        CONF_PROTOCOL_VERSION: 3.4,
+        CONF_TYPE: "kogan_kahtp_heater",
+    }
+    if with_sibling:
+        sibling = await async_setup_device(
+            hass, {**config, CONF_NAME: "sibling", CONF_DEVICE_CID: "sibling"}
+        )
+        parent = sibling._api.parent
+        socket = mocker.MagicMock()
+        parent.socket = socket
+    mocker.patch(
+        "tinytuya.Device.status", return_value={"Err": "914", "Error": "test error"}
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="failed",
+        data={**config, CONF_DEVICE_CID: "failed"},
+    )
+    with pytest.raises(ConfigEntryNotReady):
+        await async_setup_entry(hass, entry)
+    assert "synthetic-gateway/failed" not in hass.data[DOMAIN]
+    if with_sibling:
+        assert parent.children == {"sibling": sibling._api}
+        assert hass.data[DOMAIN][parent.id]["tuyadevice"] is parent
+    else:
+        assert "synthetic-gateway" not in hass.data[DOMAIN]
 
 
 @pytest.mark.asyncio
@@ -201,7 +244,9 @@ async def test_migrate_entry(hass, mocker):
     mock_device.async_inferred_type = mocker.AsyncMock(
         return_value="goldair_gpph_heater"
     )
-    mocker.patch("custom_components.tuya_local.setup_device", return_value=mock_device)
+    mocker.patch(
+        "custom_components.tuya_local.async_setup_device", return_value=mock_device
+    )
 
     entry = MockConfigEntry(
         domain=DOMAIN,

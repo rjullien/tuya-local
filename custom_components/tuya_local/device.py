@@ -47,6 +47,18 @@ def _collect_possible_matches(cached_state, product_ids):
     return list(possible_matches(cached_state, product_ids))
 
 
+async def _async_executor_job(hass, func, *args):
+    job = asyncio.ensure_future(hass.async_add_executor_job(func, *args))
+    try:
+        return await asyncio.shield(job)
+    except CancelledError:
+        # Cancelling the waiter does not stop the thread holding the socket.
+        try:
+            await job
+        finally:
+            raise
+
+
 class TuyaLocalDevice(object):
     def __init__(
         self,
@@ -92,14 +104,21 @@ class TuyaLocalDevice(object):
         self.dev_cid = dev_cid
         try:
             if dev_cid:
-                if hass.data[DOMAIN].get(dev_id) and name != "Test":
+                if (
+                    hass.data[DOMAIN].get(dev_id, {}).get("tuyadevice")
+                    and name != "Test"
+                ):
                     parent = hass.data[DOMAIN][dev_id]["tuyadevice"]
                     parent_lock = hass.data[DOMAIN][dev_id].get(
                         "tuyadevicelock", asyncio.Lock()
                     )
                 else:
                     parent = tinytuya.Device(dev_id, address, local_key)
-                    parent_lock = asyncio.Lock()
+                    parent_lock = (
+                        hass.data[DOMAIN]
+                        .get(dev_id, {})
+                        .get("tuyadevicelock", asyncio.Lock())
+                    )
                     if name != "Test":
                         hass.data[DOMAIN][dev_id] = {
                             "tuyadevice": parent,
@@ -112,14 +131,21 @@ class TuyaLocalDevice(object):
                 )
                 self._api_lock = parent_lock
             else:
-                if hass.data[DOMAIN].get(dev_id) and name != "Test":
+                if (
+                    hass.data[DOMAIN].get(dev_id, {}).get("tuyadevice")
+                    and name != "Test"
+                ):
                     self._api = hass.data[DOMAIN][dev_id]["tuyadevice"]
                     self._api_lock = hass.data[DOMAIN][dev_id].get(
                         "tuyadevicelock", asyncio.Lock()
                     )
                 else:
                     self._api = tinytuya.Device(dev_id, address, local_key)
-                    self._api_lock = asyncio.Lock()
+                    self._api_lock = (
+                        hass.data[DOMAIN]
+                        .get(dev_id, {})
+                        .get("tuyadevicelock", asyncio.Lock())
+                    )
                     if name != "Test":
                         hass.data[DOMAIN][dev_id] = {
                             "tuyadevice": self._api,
@@ -164,6 +190,28 @@ class TuyaLocalDevice(object):
         self._SINGLE_PROTO_CONNECTION_ATTEMPTS = 3
         # The number of failures from a working protocol before retrying other protocols.
         self._AUTO_FAILURE_RESET_COUNT = 10
+
+    async def _async_api_call(self, func, *args, apply_protocol=True):
+        async with self._api_lock:
+            return await _async_executor_job(
+                self._hass, self._api_call, func, args, apply_protocol
+            )
+
+    def _api_call(self, func, args, apply_protocol):
+        if self._api.parent and apply_protocol:
+            self._apply_api_protocol_version()
+        return func(*args)
+
+    def _set_socket_persistent(self, persist, shared=True):
+        if shared or not self._api.children:
+            self._api.set_socketPersistent(persist)
+        if self._api.parent and (shared or len(self._api.parent.children) <= 1):
+            self._api.parent.set_socketPersistent(persist)
+
+    async def _async_set_socket_persistent(self, persist, shared=True):
+        await self._async_api_call(
+            self._set_socket_persistent, persist, shared, apply_protocol=False
+        )
 
     @property
     def name(self):
@@ -225,9 +273,7 @@ class TuyaLocalDevice(object):
         self._children.clear()
         self._force_dps.clear()
         if self._refresh_task:
-            self._api.set_socketPersistent(False)
-            if self._api.parent:
-                self._api.parent.set_socketPersistent(False)
+            await self._async_set_socket_persistent(False, shared=False)
             await self._refresh_task
         _LOGGER.debug("Monitor loop for %s stopped", self.name)
         self._refresh_task = None
@@ -307,9 +353,7 @@ class TuyaLocalDevice(object):
         finally:
             # Ensure the persistent connection is closed when the loop exits
             # and device appears as unavailable
-            self._api.set_socketPersistent(False)
-            if self._api.parent:
-                self._api.parent.set_socketPersistent(False)
+            await self._async_set_socket_persistent(False, shared=False)
             self._reset_cached_state()
 
     @property
@@ -319,9 +363,8 @@ class TuyaLocalDevice(object):
     def pause(self):
         self._temporary_poll = True
         _LOGGER.debug("%s pausing connection temporarily", self.name, False)
-        self._api.set_socketPersistent(False)
-        if self._api.parent:
-            self._api.parent.set_socketPersistent(False)
+        if not self._api.parent:
+            self._api.set_socketPersistent(False)
 
     def resume(self):
         self._temporary_poll = False
@@ -335,9 +378,7 @@ class TuyaLocalDevice(object):
         # all dps updated
         dps_updated = False
 
-        self._api.set_socketPersistent(persist)
-        if self._api.parent:
-            self._api.parent.set_socketPersistent(persist)
+        await self._async_set_socket_persistent(persist)
 
         last_heartbeat = self._cached_state.get("updated_at", 0)
         wifi_api = self._api.parent or self._api
@@ -359,9 +400,7 @@ class TuyaLocalDevice(object):
                     _LOGGER.debug(
                         "%s persistant connection set to %s", self.name, persist
                     )
-                    self._api.set_socketPersistent(persist)
-                    if self._api.parent:
-                        self._api.parent.set_socketPersistent(persist)
+                    await self._async_set_socket_persistent(persist)
                     self._last_full_poll = 0  # ensure we start with a full poll
 
                 needs_full_poll = now - self._last_full_poll > self._POLLING_INTERVAL
@@ -389,12 +428,12 @@ class TuyaLocalDevice(object):
                     last_heartbeat = now  # reset heartbeat timer on full poll
                 elif persist:
                     if now - last_heartbeat > self._HEARTBEAT_INTERVAL:
-                        await self._hass.async_add_executor_job(
+                        await self._async_api_call(
                             self._api.heartbeat,
                             True,
                         )
                         last_heartbeat = now
-                    poll = await self._hass.async_add_executor_job(
+                    poll = await self._async_api_call(
                         self._api.receive,
                     )
                     # Ignore Payload error 904, as 3.4 protocol devices seem to return
@@ -412,9 +451,7 @@ class TuyaLocalDevice(object):
                         if poll["Err"] in {"901", "902", "905", "906", "914"}:
                             force_backoff = True
                             persist = False
-                            self._api.set_socketPersistent(False)
-                            if self._api.parent:
-                                self._api.parent.set_socketPersistent(False)
+                            await self._async_set_socket_persistent(False)
                         # increment the error count if not done already
                         if error_count == self._api_working_protocol_failures:
                             self._api_working_protocol_failures += 1
@@ -444,9 +481,7 @@ class TuyaLocalDevice(object):
                 # Close the persistent connection when exiting the loop
                 persist = False
                 _LOGGER.debug("%s receive loop interrupted", self.name)
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
+                await self._async_set_socket_persistent(False, shared=False)
                 raise
             except Exception as t:
                 _LOGGER.exception(
@@ -456,9 +491,7 @@ class TuyaLocalDevice(object):
                     t,
                 )
                 persist = False
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
+                await self._async_set_socket_persistent(False)
                 force_backoff = True
 
             if not self.has_returned_state or wifi_api.socket is None:
@@ -466,9 +499,7 @@ class TuyaLocalDevice(object):
             await asyncio.sleep(5 if force_backoff else 0.1)
 
         # Close the persistent connection when exiting the loop
-        self._api.set_socketPersistent(False)
-        if self._api.parent:
-            self._api.parent.set_socketPersistent(False)
+        await self._async_set_socket_persistent(False, shared=False)
 
     def set_detected_product_id(self, product_id):
         self._product_ids.append(product_id)
@@ -688,8 +719,7 @@ class TuyaLocalDevice(object):
         for i in range(connections):
             try:
                 if not self._hass.is_stopping:
-                    async with self._api_lock:
-                        retval = await self._hass.async_add_executor_job(func)
+                    retval = await self._async_api_call(func)
                     if isinstance(retval, dict) and "Error" in retval:
                         last_err_code = retval.get("Err")
                         last_err_msg = retval.get("Error")
@@ -714,9 +744,7 @@ class TuyaLocalDevice(object):
                     connections,
                 )
                 # Ensure we have a fresh connection for the next attempt
-                self._api.set_socketPersistent(False)
-                if self._api.parent:
-                    self._api.parent.set_socketPersistent(False)
+                await self._async_set_socket_persistent(False)
 
                 if i + 1 == connections:
                     self._reset_cached_state()
@@ -779,6 +807,12 @@ class TuyaLocalDevice(object):
         return self._pending_updates
 
     async def _rotate_api_protocol_version(self):
+        async with self._api_lock:
+            await _async_executor_job(
+                self._hass, self._rotate_api_protocol_version_sync
+            )
+
+    def _rotate_api_protocol_version_sync(self):
         if self._api_protocol_version_index is None:
             try:
                 self._api_protocol_version_index = API_PROTOCOL_VERSIONS.index(
@@ -794,6 +828,11 @@ class TuyaLocalDevice(object):
         if self._api_protocol_version_index >= len(API_PROTOCOL_VERSIONS):
             self._api_protocol_version_index = 0
 
+        self._apply_api_protocol_version()
+
+    def _apply_api_protocol_version(self):
+        if self._api_protocol_version_index is None:
+            return
         new_version = API_PROTOCOL_VERSIONS[self._api_protocol_version_index]
         _LOGGER.debug(
             "Setting protocol version for %s to %s",
@@ -822,21 +861,31 @@ class TuyaLocalDevice(object):
         else:
             self._api.disabledetect = True
 
-        await self._hass.async_add_executor_job(
-            self._api.set_version,
-            new_version,
-        )
+        if not self._api.parent or self._api.version != new_version:
+            self._api.set_version(new_version)
         if self._api.parent:
-            await self._hass.async_add_executor_job(
-                self._api.parent.set_version,
-                new_version,
-            )
+            if self._api.parent.version != new_version:
+                persist = self._api.parent.socketPersistent
+                self._api.parent.set_socketPersistent(False)
+                self._api.parent.set_version(new_version)
+                self._api.parent.set_socketPersistent(persist)
 
     @staticmethod
     def get_key_for_value(obj, value, fallback=None):
         keys = list(obj.keys())
         values = list(obj.values())
         return keys[values.index(value)] if value in values else fallback
+
+
+async def async_setup_device(hass: HomeAssistant, config: dict):
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    gateway_id = config[CONF_DEVICE_ID]
+    while True:
+        gateway = domain_data.setdefault(gateway_id, {"tuyadevicelock": asyncio.Lock()})
+        async with gateway["tuyadevicelock"]:
+            if domain_data.get(gateway_id) is not gateway:
+                continue
+            return await _async_executor_job(hass, setup_device, hass, config)
 
 
 def setup_device(hass: HomeAssistant, config: dict):
@@ -877,10 +926,27 @@ async def async_delete_device(hass: HomeAssistant, config: dict):
     if device is not None:
         await device.async_stop()
         device_entry.pop("device", None)
-    device_entry.pop("tuyadevice", None)
-    device_entry.pop("tuyadevicelock", None)
-    # Platform setup may cache entity instances in this bucket by config_id.
-    # Only drop empty buckets here; async_unload_entry removes the whole bucket
-    # after forwarded platform unloads complete.
-    if not device_entry:
-        domain_data.pop(device_id, None)
+    api = device_entry.get("tuyadevice")
+    lock = device_entry.get("tuyadevicelock", asyncio.Lock())
+    async with lock:
+        if api is not None:
+            parent = api.parent
+            if not parent and api.children:
+                # A separately configured gateway can still have active children.
+                device_entry.clear()
+                device_entry.update(tuyadevice=api, tuyadevicelock=lock)
+                return
+            await _async_executor_job(hass, api.set_socketPersistent, False)
+            if parent:
+                if parent.children.get(api.id) is api:
+                    parent.children.pop(api.id)
+                gateway = domain_data.get(parent.id)
+                if not parent.children and gateway and not gateway.get("device"):
+                    await _async_executor_job(hass, parent.set_socketPersistent, False)
+                    if gateway.get("tuyadevice") is parent:
+                        domain_data.pop(parent.id, None)
+        device_entry.pop("tuyadevice", None)
+        device_entry.pop("tuyadevicelock", None)
+        # Platforms may still have cached entities until their unload completes.
+        if not device_entry:
+            domain_data.pop(device_id, None)

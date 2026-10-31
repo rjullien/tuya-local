@@ -1,12 +1,25 @@
 import asyncio
 import logging
+import threading
 from time import time
 
 import pytest
 
 # from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_HOMEASSISTANT_STOP
-from custom_components.tuya_local.const import CONF_DEVICE_ID, DOMAIN
-from custom_components.tuya_local.device import TuyaLocalDevice, async_delete_device
+from custom_components.tuya_local.const import (
+    CONF_DEVICE_CID,
+    CONF_DEVICE_ID,
+    CONF_LOCAL_KEY,
+    CONF_POLL_ONLY,
+    CONF_PROTOCOL_VERSION,
+    DOMAIN,
+)
+from custom_components.tuya_local.device import (
+    TuyaLocalDevice,
+    async_delete_device,
+    async_setup_device,
+    setup_device,
+)
 
 from .const import EUROM_600_HEATER_PAYLOAD
 
@@ -14,7 +27,8 @@ from .const import EUROM_600_HEATER_PAYLOAD
 @pytest.fixture
 def mock_api(mocker):
     mock = mocker.patch("tinytuya.Device")
-    mock.parent = None
+    mock.return_value.parent = None
+    mock.return_value.children = {}
     yield mock
 
 
@@ -111,6 +125,223 @@ def test_has_returned_state(subject):
 
     subject._cached_state = {"updated_at": 0}
     assert not subject.has_returned_state
+
+
+@pytest.fixture
+def gateway_config():
+    def config(cid, protocol=3.4):
+        return {
+            "name": cid,
+            CONF_DEVICE_ID: "synthetic-gateway",
+            CONF_DEVICE_CID: cid,
+            "host": "127.0.0.1",
+            CONF_LOCAL_KEY: "0123456789abcdef",
+            CONF_PROTOCOL_VERSION: protocol,
+            CONF_POLL_ONLY: True,
+        }
+
+    return config
+
+
+@pytest.mark.asyncio
+async def test_gateway_lifetime_follows_last_child(
+    patched_hass, gateway_config, mocker
+):
+    first = setup_device(patched_hass, gateway_config("first"))
+    other = setup_device(patched_hass, gateway_config("other"))
+    parent = first._api.parent
+    socket = mocker.MagicMock()
+    parent.socket = socket
+    assert other._api.parent is parent
+    assert first._api_lock is other._api_lock
+    await async_delete_device(patched_hass, gateway_config("first"))
+    assert parent.children == {"other": other._api}
+    assert patched_hass.data[DOMAIN][parent.id]["tuyadevice"] is parent
+    socket.close.assert_not_called()
+    await async_delete_device(patched_hass, gateway_config("other"))
+    assert parent.children == {}
+    assert patched_hass.data[DOMAIN] == {}
+    assert parent.socket is None
+    socket.close.assert_called_once()
+    reloaded = setup_device(patched_hass, gateway_config("first"))
+    assert reloaded._api.parent is not parent
+    assert reloaded._api_lock is not first._api_lock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gateway_first", [False, True])
+async def test_separately_configured_gateway_kept_until_last_user(
+    patched_hass, gateway_config, mocker, gateway_first
+):
+    config = gateway_config("child")
+    parent_config = {**config, CONF_DEVICE_CID: None, "name": "gateway"}
+    child = await async_setup_device(patched_hass, config)
+    gateway = await async_setup_device(patched_hass, parent_config)
+    parent = child._api.parent
+    assert gateway._api is parent
+    assert gateway._api_lock is child._api_lock
+    socket = mocker.MagicMock()
+    parent.socket = socket
+
+    await async_delete_device(patched_hass, parent_config if gateway_first else config)
+    assert patched_hass.data[DOMAIN][parent.id]["tuyadevice"] is parent
+    socket.close.assert_not_called()
+    await async_delete_device(patched_hass, config if gateway_first else parent_config)
+    assert patched_hass.data[DOMAIN] == {}
+    socket.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_empty_registry_creates_fresh_gateway(patched_hass, gateway_config):
+    first = setup_device(patched_hass, gateway_config("first"))
+    parent = first._api.parent
+    patched_hass.data[DOMAIN] = {}
+    reloaded = setup_device(patched_hass, gateway_config("first"))
+    assert reloaded._api.parent is not parent
+
+
+@pytest.mark.asyncio
+async def test_protocol_rotation_waits_for_shared_lock(patched_hass, gateway_config):
+    fixed = setup_device(patched_hass, gateway_config("fixed"))
+    auto = setup_device(patched_hass, gateway_config("auto", "auto"))
+    await fixed._rotate_api_protocol_version()
+    parent = fixed._api.parent
+    async with fixed._api_lock:
+        rotation = asyncio.create_task(auto._rotate_api_protocol_version())
+        await asyncio.sleep(0)
+        assert parent.version == 3.4
+        assert not rotation.done()
+    await rotation
+    assert parent.version == 3.3
+
+
+@pytest.mark.asyncio
+async def test_child_restores_protocol_before_io(patched_hass, gateway_config, mocker):
+    fixed = setup_device(patched_hass, gateway_config("fixed"))
+    auto = setup_device(patched_hass, gateway_config("auto", "auto"))
+    await fixed._rotate_api_protocol_version()
+    parent = fixed._api.parent
+    socket = mocker.MagicMock()
+    parent.socket = socket
+    parent.socketPersistent = True
+    await auto._rotate_api_protocol_version()
+    assert parent.version == 3.3
+    assert parent.socketPersistent is True
+    socket.close.assert_called_once()
+
+    def status():
+        assert fixed._api_lock.locked()
+        assert parent.version == fixed._api.version == 3.4
+        return {"dps": {"1": True}}
+
+    mocker.patch.object(fixed._api, "status", side_effect=status)
+    await fixed.async_refresh()
+    assert fixed.get_property("1") is True
+
+
+@pytest.mark.asyncio
+async def test_socket_close_waits_for_shared_lock(patched_hass, gateway_config, mocker):
+    first = setup_device(patched_hass, gateway_config("first"))
+    other = setup_device(patched_hass, gateway_config("other"))
+    socket = mocker.MagicMock()
+    first._api.parent.socket = socket
+    async with first._api_lock:
+        close = asyncio.create_task(other._async_set_socket_persistent(False))
+        await asyncio.sleep(0)
+        socket.close.assert_not_called()
+        assert not close.done()
+    await close
+    socket.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_setup_child_waits_for_gateway_io(patched_hass, gateway_config):
+    first = await async_setup_device(patched_hass, gateway_config("first"))
+    async with first._api_lock:
+        setup = asyncio.create_task(
+            async_setup_device(patched_hass, gateway_config("other"))
+        )
+        await asyncio.sleep(0)
+        assert not setup.done()
+        assert set(first._api.parent.children) == {"first"}
+    other = await setup
+    assert other._api.parent is first._api.parent
+    assert other._api_lock is first._api_lock
+
+
+@pytest.mark.asyncio
+async def test_cancelled_io_keeps_lock_until_executor_finishes(
+    patched_hass, gateway_config, mocker
+):
+    fixed = setup_device(patched_hass, gateway_config("fixed"))
+    other = setup_device(patched_hass, gateway_config("other", "auto"))
+    await fixed._rotate_api_protocol_version()
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def status():
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(5)
+        assert fixed._api.parent.version == 3.4
+        return {"dps": {"1": True}}
+
+    mocker.patch.object(fixed._api, "status", side_effect=status)
+    mocker.patch.object(
+        patched_hass, "async_add_executor_job", side_effect=asyncio.to_thread
+    )
+    refresh = asyncio.create_task(fixed.async_refresh())
+    await asyncio.wait_for(started.wait(), timeout=5)
+    refresh.cancel()
+    rotation = asyncio.create_task(other._rotate_api_protocol_version())
+    try:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert fixed._api_lock.locked()
+        assert not rotation.done()
+        assert fixed._api.parent.version == 3.4
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await refresh
+        await rotation
+    assert fixed._api.parent.version == 3.3
+
+
+@pytest.mark.asyncio
+async def test_receive_and_heartbeat_use_shared_lock(
+    patched_hass, gateway_config, mocker
+):
+    child = setup_device(patched_hass, gateway_config("child"))
+    await child._rotate_api_protocol_version()
+    child._cached_state = {"1": True, "updated_at": time() - 7}
+    child._api.parent.socket = mocker.MagicMock()
+    child._api_protocol_working = True
+    child._poll_only = False
+    child._last_full_poll = time()
+    child._running = True
+
+    def heartbeat(*args):
+        assert child._api_lock.locked()
+        assert child._api.parent.version == 3.4
+
+    def receive(*args):
+        assert child._api_lock.locked()
+        assert child._api.parent.version == 3.4
+        return {"dps": {"1": False}}
+
+    beat = mocker.patch.object(child._api, "heartbeat", side_effect=heartbeat)
+    read = mocker.patch.object(child._api, "receive", side_effect=receive)
+    stream = child.async_receive()
+    try:
+        poll = await stream.__anext__()
+        assert poll["1"] is False
+        beat.assert_called_once()
+        read.assert_called_once()
+    finally:
+        child._running = False
+        with pytest.raises(StopAsyncIteration):
+            await stream.__anext__()
 
 
 @pytest.mark.asyncio
