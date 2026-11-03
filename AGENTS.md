@@ -81,3 +81,8 @@ export PATH="$HOME/.local/bin:$PATH"
 
 - Please separate 
 - Always run `uv run ruff check .`, `uv run ruff check --select -I .`, `uv run ruff format --check .` and `uv run yamllint custom_components/tuya_local/devices` before committing
+
+<!-- entire-agent:begin -->
+Read .entire/agent-guide.md for this repository's workflow, source inspection, and verification guidance.
+@.entire/agent-guide.md
+<!-- entire-agent:end -->
